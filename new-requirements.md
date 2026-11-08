@@ -684,3 +684,134 @@ unmounts it, and resets the tab with no post-commit correction at all.
 replace it — the look-ahead answered "is anything coming up" but could not
 answer "what did we publish last month", and its window ("the rest of this
 month plus all of next") was a span no honest copy could name.
+
+
+## 26. Фінанси — the register, one month at a time (FR-09)
+
+The Фінанси tab is built: `GET/POST/PUT/PATCH/DELETE /api/v1/finance`,
+`pages/FinancePage`, and the nav item and mobile tab that were placeholders
+until now. It reads and writes — the module ships with its create/edit form,
+not as a read-only screen — and it covers one month per view, walked with ‹ ›.
+
+`finance_entry` existed already, as three sums for the dashboard's strip: a
+type, an amount, a date. V15 gives it the identity the register's rows need
+(title, description, client, counterparty, payment status and method, due
+date, invoice number) rather than adding a second table beside it — one
+register for incomes, expenses, payouts and tax, which is what
+DESIGN_SYSTEM.md 12.7 asks for and how the money actually moved.
+
+Decisions taken with the user, and what they rule out:
+
+- **The Finance grant is agency-wide.** Unlike Clients and the content plan,
+  the register is not row-scoped by who is staffed on which client: a member
+  the owner granted Finance sees the whole picture, which is already how the
+  dashboard's revenue hero and finance strip behave. `ClientVisibility` still
+  decides which client an operation may be *filed against* — you cannot
+  invoice an account you cannot see — but it does not narrow what the register
+  shows. Row-scoping it was offered and declined; it would have needed a new
+  rule for the operations that belong to no client at all (tax, general
+  expenses), which is most of what an owner looks at.
+- **One month, with ‹ ›, not the mockup's Тиждень / Місяць / Рік tabs.** Those
+  tabs are static in `finances.html`. Real navigation over one month per
+  request is worth more than three ranges of the current one, and it keeps the
+  endpoint a single shape — the same call the content plan serves.
+- **Read and write in one pass**, including creating an operation and changing
+  an invoice's payment status. Editing the monthly revenue / tax-reserve goals
+  is still not possible: `monthly_goal` remains seeded-only.
+- **Hryvnia only.** `currency` is recorded per row so the day a tenant
+  currency exists the history says which one it was, but nothing converts and
+  FR-09's multi-currency scope stays closed.
+
+### 26a. «Прострочено» is computed, not stored
+
+The mockup's payment taxonomy has three states and the database has two.
+`PaymentStatus` is `PENDING | PAID`; overdue is `PENDING` whose `due_date` has
+passed, derived on read (`FinanceEntry.isOverdue`) and delivered as a separate
+`overdue` flag on the DTO.
+
+A stored `OVERDUE` would be wrong from the moment a deadline passed until
+whatever job flipped it next ran, and nothing in this product runs jobs. It
+also could not be *cleared* coherently: paying the invoice is what makes it
+stop being late, so "overdue" was never an independent fact about the row.
+
+Two consequences, both deliberate:
+
+- **The drawer's stepper has two buttons, not three.** An operation nobody can
+  set to overdue is one nobody can set *out* of overdue either, which is right.
+  When a row is overdue the drawer says so above the stepper instead.
+- **A row with no due date is never overdue**, however long it sits unpaid.
+  That is the honest reading — nothing was agreed — and it is what keeps every
+  already-settled expense out of the receivables figure.
+
+### 26b. The totals count money that moved; the register counts everything
+
+Every stat card, and both series of the cash-flow chart, sum **settled** rows
+only. An invoice that has been sent is not income until it is paid.
+
+This is not an interpretation — it is what the reference mockup's own numbers
+say. `finances.html` shows ₴184 200 of income above a table containing a
+₴41 000 invoice marked «Очікує», and 184 200 is exactly the sum of the paid
+rows. A cash-basis reading was the only one consistent with the design.
+
+The tax reserve is likewise **not** an expense and is not subtracted from
+profit: it is money set aside out of profit, which is why 12.7 gives it its own
+card with a goal bar instead of a month-on-month delta. Витрати is
+`EXPENSE + PAYOUT`; profit is income minus that.
+
+A month-on-month delta against an empty previous month is sent as `null` and
+renders as nothing at all. "+100%" measured from zero is a number neither side
+can stand behind.
+
+### 26c. An overdue receivable is carried into every month until it is settled
+
+The register shows the month's own operations **plus** every unpaid operation
+whose deadline has passed, whatever month it was issued in — sorted to the top,
+longest overdue first, and labelled «з минулого місяця» so its date does not
+read as a mistake. This is the mockup's own «28 черв» row sitting in a July
+table.
+
+The alternative — a strict month filter — loses an unpaid invoice the moment
+the month turns over, which is precisely when somebody needs to chase it. The
+carried rows are excluded from the summary and the chart (they are not settled,
+so they would contribute nothing anyway) and de-duplicated against the month's
+own rows, which is the bug the naive version of this has.
+
+### 26d. Two of the mockup's actions are not built
+
+The detail drawer's «Завантажити PDF» and «Надіслати нагадування» are absent.
+The first is FR-17, which belongs to the unbuilt `reports` module; the second
+needs outbound notifications, which nothing in this product has. A button that
+silently does nothing is worse than one that is not there.
+
+The primary slot the reminder occupied is now «Позначити оплаченим» — one click
+for this module's most frequent write, through the narrow
+`PATCH /finance/entries/{id}/payment-status` rather than a rebuilt full entry,
+for the reason `PUT /clients/{id}/assignees` exists (#22a): a narrow update
+cannot blank a field the caller never saw.
+
+### 26e. The mobile Finance tab was already a slot
+
+`MobileTabBar` had a hardcoded, disabled Фінанси tab after the centre FAB —
+the mockup's layout, waiting for a module. Turning it into a link is therefore
+not the "third pinned tab" the frontend CLAUDE.md warns about; it is the slot
+the bar always had, finally going somewhere. It now comes from
+`config/navItems` (`MOBILE_TRAILING_TAB_ITEMS`) like every other tab, so a
+revoked Finance grant hides it in both shells without a second place to update.
+
+### 26f. A seed migration must not key on dates it did not write
+
+V16 enriches the eight anonymous income rows V2 seeded, giving them their
+client, invoice number and description. Its first version matched them on
+`(type, amount, entry_date)`, where the date was computed from `CURRENT_DATE`
+at V16's run time.
+
+That is wrong on every database older than a day. V2's rows are dated relative
+to `CURRENT_DATE` at *V2's* run time, so on an existing dev database every one
+of those UPDATEs silently matched nothing and the register filled with rows
+called «Надходження». It only works on a database where both migrations run the
+same day — which is exactly the case a fresh CI run and a Testcontainers test
+both hit, so nothing would have caught it.
+
+The key is `(type, amount)` now, which is unique among V2's rows and does not
+move. The general rule: a later migration keying on a relative date is keying
+on when it happened to run, not on the data.
