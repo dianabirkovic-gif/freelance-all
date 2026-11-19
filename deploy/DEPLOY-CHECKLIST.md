@@ -165,12 +165,19 @@ cat > ~/backup.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 cd ~/app/freelance-all/deploy
-OUT=/var/backups/frilance/frilanceos-$(date +%F-%H%M).dump
+STAMP=$(date +%F-%H%M)
+OUT=/var/backups/frilance/frilanceos-$STAMP.dump
 docker compose -f docker-compose.prod.yml --env-file .env exec -T postgres \
   sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"' > "$OUT"
 test -s "$OUT"                                   # fail loudly on an empty dump
-find /var/backups/frilance -name '*.dump' -mtime +14 -delete
-# off-box copy, e.g.: rclone copy "$OUT" b2:frilance-backups/   (or scp to another machine)
+# The uploaded files (client contracts and briefs, ad creatives) live in the `uploads` volume, NOT in
+# the database: a dump without them restores rows that point at files that are gone.
+FILES=/var/backups/frilance/uploads-$STAMP.tar.gz
+docker compose -f docker-compose.prod.yml --env-file .env exec -T backend \
+  tar -czf - -C /data/uploads . > "$FILES"
+test -s "$FILES"
+find /var/backups/frilance \( -name '*.dump' -o -name '*.tar.gz' \) -mtime +14 -delete
+# off-box copy, e.g.: rclone copy "$OUT" "$FILES" b2:frilance-backups/   (or scp to another machine)
 EOF
 chmod +x ~/backup.sh && ~/backup.sh && ls -l /var/backups/frilance
 (crontab -l 2>/dev/null; echo '15 3 * * * /home/deploy/backup.sh >> /home/deploy/backup.log 2>&1') | crontab -
@@ -188,7 +195,10 @@ $DC exec -T postgres sh -c 'dropdb -U "$POSTGRES_USER" restore_test'
 ```
 
 Real disaster restore (replaces live data): `$DC stop backend web`, drop and recreate the database
-(`dropdb`/`createdb`), `pg_restore -d "$POSTGRES_DB"` the dump, `$DC start backend web`.
+(`dropdb`/`createdb`), `pg_restore -d "$POSTGRES_DB"` the dump, restore the files from the matching
+`uploads-<stamp>.tar.gz` into `/data/uploads` of the backend container (`$DC start backend`, then
+`$DC exec -T backend tar -xzf - -C /data/uploads < uploads-<stamp>.tar.gz`), `$DC start web`.
+Restore the dump and the archive **of the same stamp** — they are one backup.
 
 **Never run `docker compose down -v` on this host** — it deletes the `pgdata` volume.
 Plain `down`/`stop`/`restart` are safe.
@@ -205,6 +215,7 @@ docker compose -f docker-compose.prod.yml ps
 ./smoke-test.sh https://app.example.com
 ```
 
+- **This release adds migrations V17–V21** (payout recipient, client notes/files, target tasks, ad campaigns/statistics/creatives, client trash). They only add tables and nullable columns — no data is changed or removed — and were applied cleanly to an empty database under the prod profile; applying them to a *populated* production database has not been rehearsed, so take the backup first.
 - Flyway migrations are one-way. Never edit an applied migration. If the release adds a migration, the pre-deploy dump is your only way back.
 - Frontend env (`VITE_API_BASE_URL`) is baked at build time; changing it needs `--build`.
 - Rebuilding `web` or `backend` alone: `up -d --build backend` (users see a brief 502 during the restart).

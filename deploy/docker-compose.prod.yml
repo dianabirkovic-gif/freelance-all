@@ -38,6 +38,13 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?set CORS_ALLOWED_ORIGINS in .env}
       JWT_ACCESS_TOKEN_TTL_MINUTES: ${JWT_ACCESS_TOKEN_TTL_MINUTES:-1440}
+      # How long a deleted client stays recoverable in the trash before the daily purge removes it.
+      TRASH_RETENTION_DAYS: ${TRASH_RETENTION_DAYS:-30}
+    volumes:
+      # Client-card files and ad creatives (images, videos up to 100 MB). Without a volume they
+      # vanish on every redeploy while their database rows stay — back this up together with
+      # pgdata (see DEPLOY-CHECKLIST.md section 9), and mind the disk: videos add up.
+      - uploads:/data/uploads
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
       interval: 30s
@@ -66,5 +73,6 @@ services:
 
 volumes:
   pgdata:
+  uploads:
   caddy_data:
   caddy_config:

@@ -815,3 +815,247 @@ both hit, so nothing would have caught it.
 The key is `(type, amount)` now, which is unique among V2's rows and does not
 move. The general rule: a later migration keying on a relative date is keying
 on when it happened to run, not on the data.
+
+
+## 27. «Моя зп» — each team member sees only their own pay
+
+Decisions taken with the user:
+
+- **A member sees only their own payouts**, on their own screen («Моя зп»),
+  whatever their Finance grant says. Income, expenses, tax and other people's
+  pay are not on it. The owner still sees and enters everything in the register.
+- **A salary is a `PAYOUT` linked to the member who receives it.** V17 adds
+  `finance_entry.recipient_user_id` (nullable, `ON DELETE SET NULL` — revoking a
+  member deletes their account and must not erase what was paid). No separate
+  salary/rate model; a monthly rate is not built.
+- **The Finance grant is unchanged and still agency-wide (#26).** A member
+  granted Фінанси still opens the whole register; «Моя зп» is a separate screen
+  every invited member has. Restricting the register to the owner alone was
+  offered and declined.
+
+How it is kept private (all of it pinned by tests):
+
+- `GET /api/v1/finance/my-salary?month=` takes **no member id**. The recipient
+  is the authenticated principal, so there is no input that could ask for
+  somebody else's pay. It deliberately skips the `AccessService` check — the
+  grant opens the agency register, this opens one's own line of it.
+- It returns its own narrow DTO (`MySalaryDto`: no client, invoice or
+  counterparty), so nothing about the agency's money can leak through it by
+  being added to the register's DTO later.
+- Only a `PAYOUT` may carry a recipient (400 otherwise — a recipient on an
+  invoice would publish it on somebody's screen), and the recipient is resolved
+  inside the caller's tenant (an id from another agency is a 404). Choosing a
+  member writes their name into «Отримувач» server-side.
+- The register's create form gets its member picker from `FinanceDto.members`
+  (active accounts only), because `GET /team` is owner-only.
+- The nav item is hidden from OWNER/FREELANCER (they pay salaries, not receive
+  one) and shown to everyone else; the route itself is open to any signed-in
+  user and returns an empty month to an owner.
+
+Existing payouts have no recipient and stay free text: they appear in the
+register but on nobody's «Моя зп» until the owner re-files them against a member.
+Not built: a monthly rate/accrual, and payslip export.
+
+
+## 28. Overview for the team — no agency money, team load only for owner and PM
+
+Decisions taken with the user (extends #27):
+
+- **The Overview shows a team member none of the agency's money.** Revenue hero,
+  the «Фінансовий стан» strip and the amounts on the event ledger are the
+  agency owner's (`RoleAccessPolicy.Access#ownsTenant`). This is narrower than the
+  Finance grant on purpose: the grant still opens the register on its own screen
+  (#26), but it no longer puts agency income on the landing page.
+- **The finance strip is the member's own pay instead.** Same panel, `scope:
+  PERSONAL`, titled «Моя зп цього місяця», with «Виплачено» / «Очікує виплати» for
+  the current month, drawn from the caller's own payouts (#27). No payouts yet is
+  an empty list with its own message — not two ₴0 rows.
+- **«Завантаженість команди» is for the owner and the project manager only**
+  (`Access#canViewTeamWorkload`). It was owner-only before. A PM sees the load
+  without being able to invite or edit anyone; a freelancer has no team, so none.
+- **MONEY-tagged ledger lines are dropped for members**, not just stripped of
+  their amount: «Оплатила рахунок MUSE'23» is itself the financial fact.
+
+The frontend hides the revenue and team panels instead of drawing empty boxes, and
+the content-plan / attention panels keep following their own section grants.
+
+
+## 29. Content plan → PDF for the client
+
+The content plan page has «Експорт у PDF»: pick a client and a period, get a
+document the studio sends the client.
+
+Decisions taken with the user:
+
+- **Download only — the product does not send it.** Nothing here has outbound
+  email/messaging (same gap as #26d's reminder), so the file is saved to the
+  member's device and sent by them. The dialog says so. A «Поділитися» button
+  was offered and declined.
+- **Drafts are the member's choice per export**, off by default. «Заплановано»
+  (`DRAFT`) is the studio's internal kitchen; a client is not shown it unless the
+  member switches it on in the dialog.
+- **A client-facing document: no internal fields.** Rating, author and ids are
+  not printed. What remains is date + weekday, format, title + the note as plain
+  text, and status — a table, sorted by date, header repeated on every page,
+  with the client, the period, the post count and a page-numbered footer.
+- **One client at a time, period of up to 12 months** (each month is one
+  request to the existing `GET /content-plan`, so the bound is what stops an
+  unbounded burst). Quick presets «Цей місяць» / «Наступний місяць».
+
+How it is built:
+
+- Entirely client-side: the plan is read fresh (`staleTime: 0`, never from the
+  page's cache — a file leaving the building should match the plan as it is now)
+  through the endpoint the member already has, so it can only contain what they may
+  see. No backend change and no new permission: READ access is enough.
+- `pdfmake` with its bundled Roboto, the only built-in font covering Cyrillic.
+  It is ~1 MB, so it is imported dynamically on the first export and the content
+  plan's own bundle does not pay for it.
+- The document is built by a pure function (`buildContentPlanPdf`) so its layout
+  is unit-tested without rendering. The note's sanitized HTML is reduced to text
+  with `DOMParser` (inert; only `textContent` is read) — markup never reaches the PDF.
+- Colours are the light-theme token values as literals: a PDF has no stylesheet,
+  and a printed page is white whichever theme the app is in.
+
+
+## 30. The client card — owner-only edit, own income, shared notes and files
+
+Decisions taken with the user:
+
+- **Editing a client's terms is the agency owner's.** The edit form (every field:
+  name, niche, staffing, status, stage, tariff, fee, start date, contact) and the
+  status change / «Архівувати» are `ownsTenant` only — `PUT /clients/{id}` and
+  `PATCH /clients/{id}/status` answer 403 to a member, even with Clients FULL.
+  Creating a client, restaffing and deleting stay on the Clients grant (offered
+  as owner-only too, and declined). The detail DTO carries the deal's terms
+  (`tariffPlan`, `cooperationStartDate`, `serviceCost`) **to the owner only** —
+  they are what the form starts from; a member's response has them null.
+- **Income from a client is your own, or all of it.** The owner (and a freelancer)
+  sees what the client is worth to the agency — the service cost. A team member
+  sees only what *they* were paid for that client this month: the settled
+  `PAYOUT`s addressed to them (#27) and filed against that client. No new model —
+  the owner already files a payout against a client and a member (#27). `revenueScope`
+  (`AGENCY` / `PERSONAL`) says which one a figure is, and the card labels it
+  «Мій дохід із клієнта» for a member. No payouts means no figure (a dash), never ₴0.
+  This also applies to the clients list's «Дохід / міс» column.
+- **Notes are shared** by everyone who can see the client, plain text (≤ 5000), with
+  author and date. Add needs Clients FULL; edit/delete is the author or the owner,
+  decided server-side (`canModify`) so the UI never infers it.
+- **Files are shared the same way**: any member who can see the client reads and
+  downloads; adding needs Clients FULL; delete is the uploader or the owner.
+
+How files are kept safe (pinned by tests):
+
+- Bytes live on the server's disk under a random UUID key (`FileStorage`,
+  `STORAGE_DIR`, a volume in the prod compose); the user's filename is stored and
+  shown but **never touches a path** — and a name like `../../x.pdf` is reduced
+  to its last segment.
+- An **extension allow-list** decides what may be uploaded and also what
+  content type it is served as. The browser's claim is ignored; nothing scriptable
+  (html, svg, js) or executable is on the list. 10 MB per file.
+- Downloads are **always attachments with `nosniff`**, fetched through the
+  bearer token (a plain link cannot send it).
+- Every read goes through `ClientVisibility`, so a client a member cannot see is a
+  404 — the same as for a client in another agency.
+- Deleting a file or a client removes the bytes after the transaction commits;
+  an upload whose row never commits removes them again.
+
+The `Фінанси` tab of the card is still the mockup's placeholder.
+
+## Таргет: task board for the targetologist
+
+Decided with the owner: the first version of the **Таргет** section is the
+targetologist's **tasks**, entered by hand — not FR-13's ad metrics (budget,
+reach, clicks, leads, CTR/CPL) and not an ad-platform integration. Those stay
+unbuilt and are the natural next step.
+
+- A task belongs to one client and has a kind (creatives / launch / optimisation
+  / report / other), a title, an optional plain-text description (≤ 2000) and an
+  optional due date, and moves To do → In progress → Done.
+- Access is the **TARGET** section grant (read opens the board, edit writes),
+  and a member sees only the tasks of clients they may see — the same
+  `ClientVisibility` rule as the content plan. A task of another agency or of an
+  unseen client is a 404.
+- A completed client takes no new task (the same rule as #23); its existing tasks
+  stay editable and closable.
+- "Overdue" is open and past its due date, decided server-side.
+- Not done yet: assigning a task to a specific member, comments, and the
+  Overview/dashboard showing the targetologist's load.
+
+### Таргет, part 2: campaign statistics, analysis, creatives
+
+Asked for by the owner, on top of the task board.
+
+- **Campaigns** per client: name, platform (Meta / Google / TikTok / other), status
+  (active / paused / finished), start and optional end date, optional budget.
+- **Statistics are typed in, one row per campaign per day**: spend, impressions,
+  reach, clicks, leads and an optional revenue. Saving a date that already has a row
+  replaces it. Clicks and reach cannot exceed impressions.
+- **Analysis** over a period (default last 30 days, at most 366): totals, per
+  campaign, per platform and per day, with CTR, CPC, CPL, CPM and ROAS. Ratios are
+  computed from the sums, and "nothing to divide by" is a dash, not zero. The campaign
+  with the lowest CPL is flagged, but only when at least two campaigns have one.
+- **Creatives**: static images (PNG, JPG, GIF, WebP, ≤ 10 MB) and video (MP4, MOV,
+  WebM, ≤ 100 MB), per client and optionally tied to a campaign. Content is verified
+  by its bytes, not just its name. Uploaded by anyone with Target edit access; delete
+  is the uploader or the owner.
+- **Report (PDF)**: «Звіт у PDF» on the Аналітика tab builds a document **for one client**
+  and a period (never mixed clients): totals, plain-language findings (spend and leads,
+  cheapest and dearest campaign by CPL, best day, ROAS when there is revenue), campaigns,
+  platforms and the day-by-day table. Findings are stated only when the data supports
+  them (no "best" among one campaign, none when prices are equal). It is generated in the
+  browser from the same server figures the screen shows, and is open to anyone who can
+  open the analysis. Money in the PDF is written with the currency as a word («грн») —
+  the embedded font has no ₴ glyph.
+- **CSV import** of statistics («Імпорт CSV» in a campaign's statistics drawer): the member
+  exports a day-by-day report from Meta Ads Manager, Google Ads or TikTok Ads and uploads
+  it. The browser reads it (UTF-8, UTF-8/UTF-16 with BOM, Windows-1251; comma, semicolon or
+  tab), recognises the columns by their English and Ukrainian headers, and shows a preview —
+  how many days are new, how many replace existing ones, which rows are skipped and why —
+  before anything is sent. The member can correct any column. Rules that matter:
+  - the header row is found below any title lines, and "Total" lines are ignored;
+  - several lines for one date (ad sets / ads) are **summed**; a file with several
+    campaigns must be narrowed to one first, or their days would be added together;
+  - a row with an unreadable or negative figure, or clicks/reach above impressions, is
+    reported and left out — and its whole date with it, so a day is never stored as a
+    smaller total than the real one;
+  - "--" or an empty cell is zero; a date that is a title or total is not an error;
+  - the server takes all rows or none (one transaction), refuses the same date twice,
+    and at most 400 days; a date that already has data is replaced, so re-uploading a file
+    changes nothing.
+- Not done yet: Excel (.xlsx) files (save as CSV first), live ad-platform sync (Meta /
+  Google / TikTok API), and a report that includes creatives or is sent to the client by email.
+
+## Deleting a client, and the trash
+
+The owner (and a freelancer, who owns their own tenant) can delete a client from the client card
+(«Видалити», red, next to «Архівувати»). Nobody else is offered it, and the backend refuses them
+(403) — deleting is the most destructive thing the section does, so it is held to the same bar as
+editing the card.
+
+**Deleting moves the client to the trash; it does not erase it.** The client disappears from the
+app at once — the clients list, the content plan, Target, the Overview, the client's own card — but
+everything it had (posts, campaigns and statistics, creatives, files, notes, tasks, staffing) is left
+exactly where it is. «Кошик» is a tab on the Clients page, next to the status filters, **owner-only**
+(nobody else sees the tab, and nothing is requested for them).
+
+- **Restore** («Відновити») brings the client back with all of it, as it was. No confirmation needed:
+  it is harmless and reversible.
+- **Retention:** 30 days (`app.trash.retention-days`, env `TRASH_RETENTION_DAYS`). The trash shows each
+  client's deletion date, who deleted it, and how many days are left; the last three days are flagged.
+- **Deleting for good** happens three ways, each irreversible: «Видалити назавжди» on one client,
+  «Очистити кошик» for all of them (both ask first, naming what is lost), and the daily purge (03:30,
+  `app.trash.purge-cron`) once a client has been in the trash longer than the retention. A client that is
+  *not* in the trash cannot be purged directly — it has to be deleted first.
+- **Goes with a purged client:** notes, files (and their bytes on disk), content plan posts, ad
+  campaigns with their statistics, creatives (and their bytes), target tasks, the staffing.
+- **Always stays:** finance entries. Money that moved is a record of the agency, not the client's data;
+  they lose only their link to the client and keep the client's name as it was written. The Overview's
+  activity feed is kept too. (While a client is merely in the trash, finance entries keep their link and
+  their client name; restoring changes nothing there.)
+- **Archiving is a different thing:** it ends a cooperation and keeps the client visible in the
+  «Архів» filter; deleting removes it from sight. The delete confirmation points to archiving for a
+  cooperation that has simply ended.
+- Not done: deleting several clients at once, and a trash for individual posts, files or campaigns
+  (those are still deleted for good, with a confirmation).
+
